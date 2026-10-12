@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/anusha2211/instacloud-runtime/internal/apiserver"
+	"github.com/anusha2211/instacloud-runtime/internal/controller"
 	"github.com/anusha2211/instacloud-runtime/internal/logging"
 	"github.com/anusha2211/instacloud-runtime/internal/scheduler"
 	"github.com/anusha2211/instacloud-runtime/internal/store"
@@ -42,6 +43,8 @@ func main() {
 
 	sched := &scheduler.Loop{Store: st, Scheduler: scheduler.New(), Log: log.With("loop", "scheduler")}
 	go sched.Run(ctx)
+	ctrl := &controller.Controller{Store: st, Log: log.With("loop", "reconciler")}
+	go ctrl.Run(ctx)
 
 	// Periodic snapshots: a crash loses at most a few seconds of writes, and
 	// every controller is level-triggered so it simply re-converges.
