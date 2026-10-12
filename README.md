@@ -1,11 +1,12 @@
 # instacloud-runtime
 
-Compute runtime and orchestration layer for InstaCloud: schedules and runs
-stateless and stateful workloads across a fleet of machines.
+Compute runtime and orchestration layer for InstaCloud: schedules, runs, routes,
+scales and heals stateless and stateful workloads across a fleet of machines.
 
-> Work in progress. Start with [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the problem breakdown.
+> Work in progress. Start with [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the
+> problem breakdown and [docs/DESIGN.md](docs/DESIGN.md) for the architecture.
 
-## Layout (planned)
+## Layout
 
 ```
 cmd/         binaries (control plane, node agent, CLI)
