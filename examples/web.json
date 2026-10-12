@@ -1,0 +1,14 @@
+{
+  "metadata": { "name": "web" },
+  "spec": {
+    "kind": "service",
+    "replicas": 3,
+    "command": ["./bin/demoapp"],
+    "env": { "VERSION": "v1" },
+    "resources": { "milliCPU": 250, "memoryMB": 128 },
+    "port": true,
+    "healthCheck": { "path": "/healthz", "intervalSeconds": 1, "failureThreshold": 3 },
+    "placement": { "antiAffinity": false },
+    "terminationGraceSeconds": 5
+  }
+}
