@@ -3,7 +3,7 @@
 Compute runtime and orchestration layer for InstaCloud: schedules and runs
 stateless and stateful workloads across a fleet of machines.
 
-> Work in progress. Design docs live under `docs/`, code under `cmd/` and `internal/`.
+> Work in progress. Start with [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the problem breakdown.
 
 ## Layout (planned)
 
