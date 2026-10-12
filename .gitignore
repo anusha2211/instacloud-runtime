@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Runtime data
+/.data/
+/tmp/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
