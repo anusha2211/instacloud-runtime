@@ -1,6 +1,6 @@
 # InstaCloud Compute Runtime - Design
 
-_Draft - still filling in sections._
+_Last updated Oct 12, 2026._
 
 How a workload goes from a submitted spec to isolated, running, reachable replicas,
 and how it stays that way through load changes, deploys and failures.
@@ -324,3 +324,69 @@ the scheduler is what makes the scale-down side effective.
 - Still missing for production: a proper event stream object type, per-replica log shipping from the
   VM serial console / stdout to a log pipeline, distributed tracing through the router,
   SLO dashboards (scheduling latency, time-to-ready, recovery time after node loss).
+
+## 13. Key tradeoffs
+
+| Decision | Chosen | Alternative | Why |
+|---|---|---|---|
+| Isolation | Firecracker microVMs | containers, gVisor | Untrusted multi-tenant code needs a hardware boundary; Firecracker keeps startup and density close to containers. Cost: more complex networking/storage plumbing (tap devices, block devices instead of bind mounts). |
+| Control model | Declarative, level-triggered reconcilers over a shared store | Imperative workflows / RPC between services | Self-healing after any crash or missed event; each controller testable alone. Cost: eventual consistency, harder to reason about latency of a single action. |
+| Coordination | All state in one store, controllers communicate via objects | Direct service-to-service calls | One source of truth, trivial audit, components can be restarted independently. Cost: store becomes the scaling bottleneck (see evolution). |
+| Node communication | Agents pull assignments | Control plane pushes to nodes | One-directional trust boundary, natural backpressure, works through NAT. Cost: assignment latency = poll interval (mitigated with long-poll/watch). |
+| Placement signal | Requests (reservations) | Live usage | Predictable, no feedback loops. Cost: lower utilisation; addressed later with usage-aware over-commit pools. |
+| Placement policy | Pack across workloads, spread within | Pure spread / pure pack | Keeps whole machines free (scale-down, big jobs, maintenance) while one node/zone loss only hurts a fraction of any service. |
+| Node failure | Lease timeout, replace stateless immediately, fence stateful first | Replace everything immediately | Duplicates are harmless for stateless, corrupting for stateful. Cost: slower recovery for stateful replicas. |
+| Restart handling | On the agent with backoff | Control plane decides every restart | Fast, works during control-plane outage, avoids thundering herd on the API. |
+| Autoscaling signal | Router RPS with stabilisation | CPU only | RPS tracks demand directly and is available for every service; CPU lags and is noisy for I/O-bound apps. |
+| Store in this repo | In-memory with snapshot file | etcd / Raft | Keeps the repo self-contained. The `Store` interface is the seam where etcd or a Raft log plugs in. |
+
+## What is left out and why
+
+Cut on purpose so the time goes into the core orchestration logic actually working
+end to end:
+
+- Firecracker runtime - needs KVM and root; the runtime interface and the design
+  above are what matter, and the process runtime exercises the same agent code paths.
+- Overlay networking / per-replica IPs - host ports are enough to demonstrate
+  endpoint discovery, readiness-gated routing and failover.
+- Network block storage - simulated by a shared directory; the binding, fencing and
+  re-attach logic in the reconciler is the interesting part and is implemented.
+- HA control plane / Raft - single process with an in-memory store and periodic
+  snapshot; HA is an operational property that would not change the controller design.
+- AuthN/Z, tenants, quotas - essential for production, orthogonal to orchestration.
+- Image distribution, log pipeline, tracing - standard infrastructure with
+  well-known solutions.
+- Preemption, priorities, GPUs, batch/gang scheduling - additive scheduler plugins.
+
+## 15. Evolution with scale
+
+**Now (this repo, tens of nodes):** Single control-plane process,
+in-memory store, polling agents, one router.
+
+**Production v1, hundreds of nodes in one region:**
+- Store -> etcd (or Raft-replicated log) with 3-5 members; controllers run 2+ replicas
+  with leader election via store leases.
+- Agents use watch/long-poll instead of polling; heartbeats move to lightweight lease
+  objects so they do not churn the main object.
+- Firecracker runtime, overlay network, network block volumes with attachment fencing.
+- Router becomes a horizontally scaled fleet behind L4 load balancers, fed by an
+  endpoint-discovery service rather than reading the store.
+- AuthN/Z, per-tenant quotas enforced at admission.
+
+**Thousands of nodes per region:**
+- **Cells:** shard the fleet into independent cells (~2-5k nodes each) with their own
+  control plane; a thin global layer places workloads into cells. Blast radius of any
+  control-plane bug is one cell.
+- **Scheduler throughput:** optimistic concurrency with multiple schedulers over shared
+  state (Omega-style), sampling a subset of feasible nodes per decision instead of
+  scoring all, and caching node aggregates.
+- **Observability at scale:** metrics aggregated per cell, sampled tracing, event
+  retention policies.
+- Over-commit pools driven by live usage, priority and preemption, fleet autoscaling
+  tied to pending-instance pressure.
+
+**Multi-region** (furthest out, least thought through):
+- Global API with per-region control planes; workloads declare region placement.
+- Global anycast/edge routing with health-aware failover between regions.
+- Stateful workloads replicate across regions at the application or storage layer;
+  the orchestrator handles placement and fencing, not data replication.
