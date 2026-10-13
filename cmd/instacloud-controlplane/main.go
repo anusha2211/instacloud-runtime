@@ -14,21 +14,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anusha2211/instacloud-runtime/internal/api"
 	"github.com/anusha2211/instacloud-runtime/internal/apiserver"
 	"github.com/anusha2211/instacloud-runtime/internal/controller"
 	"github.com/anusha2211/instacloud-runtime/internal/logging"
 	"github.com/anusha2211/instacloud-runtime/internal/nodemon"
+	"github.com/anusha2211/instacloud-runtime/internal/router"
 	"github.com/anusha2211/instacloud-runtime/internal/scheduler"
 	"github.com/anusha2211/instacloud-runtime/internal/store"
 )
 
 func main() {
 	var (
-		listen   = flag.String("listen", ":7070", "API listen address")
-		dataDir  = flag.String("data-dir", ".data/controlplane", "directory for state snapshots")
-		logLevel = flag.String("log-level", "info", "debug|info|warn|error")
-		hbGrace  = flag.Duration("heartbeat-grace", 10*time.Second, "node heartbeat lease; no heartbeat for this long marks the node NotReady")
-		fence    = flag.Duration("stateful-fence-delay", 12*time.Second, "wait after node loss before moving a stateful replica (must exceed the agent lease)")
+		listen     = flag.String("listen", ":7070", "API listen address")
+		dataDir    = flag.String("data-dir", ".data/controlplane", "directory for state snapshots")
+		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
+		hbGrace    = flag.Duration("heartbeat-grace", 10*time.Second, "node heartbeat lease; no heartbeat for this long marks the node NotReady")
+		fence      = flag.Duration("stateful-fence-delay", 12*time.Second, "wait after node loss before moving a stateful replica (must exceed the agent lease)")
+		routerAddr = flag.String("router-listen", ":8080", "L7 router listen address (empty to disable)")
 	)
 	flag.Parse()
 	log := logging.New("controlplane", *logLevel)
@@ -50,6 +53,23 @@ func main() {
 	go ctrl.Run(ctx)
 	mon := &nodemon.Monitor{Store: st, Log: log.With("loop", "nodemon"), Grace: *hbGrace}
 	go mon.Run(ctx)
+
+	var rt *router.Router
+	if *routerAddr != "" {
+		rt = router.New(log.With("loop", "router"))
+		go rt.Sync(ctx, func(context.Context) ([]api.Instance, error) {
+			return store.List[api.Instance](st, api.KindInstance)
+		}, 500*time.Millisecond)
+		rsrv := &http.Server{Addr: *routerAddr, Handler: rt, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Info("router listening", "addr", *routerAddr)
+			if err := rsrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("router server", "err", err)
+				cancel()
+			}
+		}()
+		defer rsrv.Close()
+	}
 
 	// Periodic snapshots: a crash loses at most a few seconds of writes, and
 	// every controller is level-triggered so it simply re-converges.
