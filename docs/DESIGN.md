@@ -187,3 +187,140 @@ is removed from rotation before it is restarted.
 
 Stateful replicas also get stable per-ordinal addresses (`/w/<workload>-<ordinal>/`)
 so clients and peers can address a specific member.
+
+## 8. Workload lifecycle
+
+See [diagrams/lifecycle.md](diagrams/lifecycle.md) for the state machine and
+[diagrams/dataflow.md](diagrams/dataflow.md) for the end-to-end sequence.
+
+```
+Pending -> Scheduled -> Starting -> Running -> Terminating -> Terminated
+              \            \           \ 
+               \            -> Failed   -> Unhealthy -> (restart) -> Starting
+                -> Lost (node died)        -> Failed (restart budget exceeded) 
+```
+
+| Phase | Owner | Meaning |
+|---|---|---|
+| `Pending` | reconciler | instance object exists, no node |
+| `Scheduled` | scheduler | bound to a node, agent has not started it yet |
+| `Starting` | agent | runtime started, waiting for first successful health check |
+| `Running` | agent | process alive; `ready` reflects the latest health check |
+| `Unhealthy` | agent | health check failure threshold exceeded, restart pending |
+| `Failed` | agent | exited / crash-looping; waiting on backoff timer |
+| `Lost` | node monitor | node stopped heartbeating; status unknown |
+| `Terminating` | reconciler | asked to stop (scale down, rollout, delete) |
+| `Terminated` | agent | stopped, resources released; object then garbage-collected |
+
+Transitions are validated in one place (`api.CanTransition`), so an out-of-order
+status report (e.g. an agent reporting `Running` for an instance the reconciler has
+already marked `Terminating`) is rejected instead of resurrecting it.
+
+Graceful termination: the reconciler sets `Terminating`; the router stops sending
+traffic as soon as it sees it; the agent sends SIGTERM (or ACPI shutdown to the VM),
+waits the grace period (default 10s), then SIGKILL, releases the port and cgroup, and
+reports `Terminated`. Volumes are retained.
+
+## 9. Failure detection and recovery
+
+| Failure | Detected by | Response |
+|---|---|---|
+| Process exits / crashes | agent (wait on child) | restart in place with exponential backoff (1s, 2s, 4s ... cap 60s, reset after 60s healthy) |
+| Process hung / unhealthy | agent HTTP health probe, N consecutive failures | mark not ready (router drains), then restart with backoff |
+| OOM | runtime (cgroup `memory.events`) | as crash, reason `OOMKilled` |
+| Node dies / partitions | node monitor: heartbeat lease (default 10s) expired | node `NotReady`; its instances `Lost`; reconciler replaces them elsewhere |
+| Agent restarts | agent on boot | re-adopts or restarts its assignments from the control plane (assignments are the source of truth) |
+| Control plane down | agents, router | data plane keeps running last known state; reconcile resumes on recovery |
+| Scheduler/reconciler crash | - | stateless; resync from store on restart |
+
+### Lost vs. dead
+
+The tricky part. A node that stops heartbeating may just be partitioned.
+For **stateless** replicas we replace immediately - a temporary duplicate is harmless.
+For **stateful** replicas a duplicate is dangerous (two writers on one volume), so the
+replacement for ordinal *k* is only started once the old one is fenced: in production by
+revoking the volume attachment at the storage layer (and the VM is killed by the node's
+own watchdog when it loses its lease); in this repo the reconciler waits an extra
+`statefulFenceDelay` after `NotReady` before re-binding the volume. When a partitioned
+agent comes back it sees its instances are no longer assigned to it and stops them.
+
+## 10. Stateful workloads and persistent volumes
+
+Stateful workloads get, per ordinal:
+
+- a stable **identity**: instance name `<workload>-<ordinal>` and env `INSTANCE_ORDINAL`,
+  kept across restarts and rescheduling;
+- a **volume** `<workload>-<vol>-<ordinal>` created before the instance and never
+  deleted on scale-down (deleted only with the workload, if `retainVolumes=false`);
+- **ordered** operations: ordinal *k* is created only once *k-1* is `Running` and ready;
+  scale-down removes the highest ordinal first; rollouts go highest to lowest.
+
+Volumes follow the replica. In production volumes are network block devices
+(Ceph RBD / EBS-style) attached to whichever node runs the replica, with
+single-attachment enforced by the storage service - which is also the fencing
+mechanism. Node-local NVMe volumes are an option for latency-sensitive databases;
+then the scheduler pins the replica to that node and recovery means restoring from
+replication/backup rather than re-attaching.
+
+In this repo a volume is a directory under a shared data root (standing in for a
+network volume). The scheduler records `boundNode` on attach; when the instance moves,
+the reconciler re-binds the volume to the new node and the same data shows up there -
+the demo writes a key on `kv-1`, kills its node, and reads the key back after `kv-1`
+lands elsewhere.
+
+## 11. Deployments, restarts and scaling
+
+### Rolling updates (built)
+
+Changing the spec bumps `generation`. The reconciler
+replaces instances whose generation is stale one at a time (`maxSurge=1,
+maxUnavailable=0` for services): create a new instance, wait until it is ready, then
+terminate one old one. A rollout never reduces ready capacity below `replicas`. If the
+new generation does not become ready within a deadline the rollout stalls (and is
+visible in status) instead of continuing to replace healthy old replicas. Stateful
+workloads roll one ordinal at a time, highest first, reusing the same volume.
+
+### Restarts
+
+Restart policy is `Always` for services and stateful replicas.
+Backoff state lives on the agent (so it survives control-plane outages) and is
+reported in instance status (`restarts`, `message`).
+
+### Autoscaling (built)
+
+The autoscaler periodically computes, per workload with an
+`autoscale` block:
+
+```
+desired = ceil(observedRPS / targetRPSPerReplica)   clamped to [min, max]
+```
+
+with two guards against flapping: a **tolerance band** (ignore changes within 10%) and
+a **scale-down stabilisation window** (use the max recommendation over the last N
+minutes before scaling down; scale up immediately). Scaling writes `replicas` only, so
+it never triggers a rollout. Using RPS from the router since it's closest to actual demand. CPU from agents is the
+obvious second signal - open question whether to combine them (max of the two
+recommendations, like HPA does) or let the workload pick one.
+
+### Cluster autoscaling (not built)
+
+When pending instances cannot be placed for longer than
+a threshold, a fleet autoscaler requests machines from the provisioning layer;
+nodes that stay under a utilisation floor are drained and returned. Bin-packing in
+the scheduler is what makes the scale-down side effective.
+
+## 12. Observability
+
+- Metrics: every binary exposes `/metrics` in Prometheus text format.
+  Control plane: API request counts/latency, scheduling attempts/latency/failures,
+  reconcile loop duration, instances by phase, nodes by status, autoscaler decisions.
+  Agent: instance starts/restarts/exits, health probe results, cgroup enforcement.
+  Router: requests, upstream errors, latency per workload.
+- Logs: JSON logs via `log/slog` with consistent keys
+  (`workload`, `instance`, `node`, `phase`) so one replica's life can be traced across
+  components with a single query.
+- Events (minimal for now): instance `message` carries the last reason
+  (`OOMKilled`, `health check failed 3x`, `node lost`, `no node fits: insufficient memory`).
+- Still missing for production: a proper event stream object type, per-replica log shipping from the
+  VM serial console / stdout to a log pipeline, distributed tracing through the router,
+  SLO dashboards (scheduling latency, time-to-ready, recovery time after node loss).
