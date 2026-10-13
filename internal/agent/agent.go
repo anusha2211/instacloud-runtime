@@ -52,15 +52,18 @@ type Config struct {
 	// has been declared dead and fences itself by stopping stateful instances,
 	// so a partitioned node never keeps writing to a volume that has moved.
 	LeaseDuration time.Duration
+	StartupGrace  time.Duration
+	Backoff       Backoff
 }
 
 // Agent manages instances on one node.
 type Agent struct {
-	cfg Config
-	api *client.Client
-	rt  runtime.Runtime
-	log *slog.Logger
-	now func() time.Time
+	cfg    Config
+	api    *client.Client
+	rt     runtime.Runtime
+	prober Prober
+	log    *slog.Logger
+	now    func() time.Time
 
 	mu       sync.Mutex
 	insts    map[string]*local
@@ -78,6 +81,7 @@ type local struct {
 	startedAt time.Time
 	restarts  int
 	nextStart time.Time
+	health    healthState
 	status    api.InstanceStatus // desired report
 	reported  api.InstanceStatus // last successfully reported
 	stopping  bool
@@ -93,6 +97,12 @@ func New(cfg Config, c *client.Client, rt runtime.Runtime, log *slog.Logger) *Ag
 	if cfg.LeaseDuration == 0 {
 		cfg.LeaseDuration = 10 * time.Second
 	}
+	if cfg.StartupGrace == 0 {
+		cfg.StartupGrace = 15 * time.Second
+	}
+	if cfg.Backoff == (Backoff{}) {
+		cfg.Backoff = DefaultBackoff()
+	}
 	if abs, err := filepath.Abs(cfg.VolumeRoot); err == nil {
 		cfg.VolumeRoot = abs
 	}
@@ -101,8 +111,12 @@ func New(cfg Config, c *client.Client, rt runtime.Runtime, log *slog.Logger) *Ag
 	}
 	a := &Agent{cfg: cfg, api: c, rt: rt, log: log.With("node", cfg.NodeName),
 		now: time.Now, insts: map[string]*local{}, ports: map[int]string{}}
+	a.prober = HTTPProber{}
 	return a
 }
+
+// SetProber replaces the health prober (tests).
+func (a *Agent) SetProber(p Prober) { a.prober = p }
 
 // Register announces the node to the control plane, retrying until it works.
 func (a *Agent) Register(ctx context.Context) error {
@@ -256,6 +270,7 @@ func (a *Agent) tickLocal(ctx context.Context) {
 // step is the per-instance state machine on the node.
 func (a *Agent) step(ctx context.Context, l *local) {
 	now := a.now()
+	spec := l.inst.Spec
 
 	if l.inst.Status.Phase == api.PhaseTerminating {
 		if !l.stopping {
@@ -288,7 +303,44 @@ func (a *Agent) step(ctx context.Context, l *local) {
 		return
 	}
 
-	l.status.Phase, l.status.Ready = api.PhaseRunning, true
+	// Reset backoff after a stable period.
+	if l.restarts > 0 && now.Sub(l.startedAt) > a.cfg.Backoff.ResetAfter && l.status.Ready {
+		l.restarts = 0
+	}
+
+	hc := spec.HealthCheck
+	if hc == nil {
+		l.status.Phase, l.status.Ready = api.PhaseRunning, true
+		return
+	}
+	if !l.health.due(now, hc) {
+		return
+	}
+	perr := a.prober.Probe(ctx, l.status.Endpoint, hc)
+	ready, failed := l.health.record(now, perr, hc, l.startedAt, a.cfg.StartupGrace)
+	if perr == nil {
+		agentProbes.Inc(l.inst.Workload, "success")
+	} else {
+		agentProbes.Inc(l.inst.Workload, "failure")
+	}
+	switch {
+	case failed:
+		l.status.Ready = false
+		l.status.Phase = api.PhaseUnhealthy
+		msg := fmt.Sprintf("health check failed %dx: %v", l.health.consecFails, perr)
+		a.log.Warn("instance unhealthy; restarting", "instance", l.inst.Name, "err", perr)
+		a.report(ctx, l) // let the router drain it before we kill it
+		_ = a.rt.Stop(ctx, l.inst.Name, grace(spec))
+		agentExits.Inc(l.inst.Workload, "HealthCheckFailed")
+		a.scheduleRestart(l, msg)
+	case ready:
+		l.status.Phase, l.status.Ready, l.status.Message = api.PhaseRunning, true, ""
+	default:
+		l.status.Ready = false
+		if l.health.successes > 0 {
+			l.status.Message = fmt.Sprintf("health check failing (%d/%d): %v", l.health.consecFails, hc.FailureThreshold, perr)
+		}
+	}
 }
 
 func (a *Agent) start(ctx context.Context, l *local) {
@@ -316,12 +368,15 @@ func (a *Agent) start(ctx context.Context, l *local) {
 	}
 	agentStarts.Inc(l.inst.Workload)
 	l.port, l.started, l.startedAt = port, true, a.now()
+	l.health = healthState{}
 	st, _ := a.rt.Status(l.inst.Name)
 	l.status = api.InstanceStatus{Phase: api.PhaseStarting, Restarts: l.restarts, PID: st.PID}
 	if port > 0 {
 		l.status.Endpoint = fmt.Sprintf("%s:%d", a.cfg.Address, port)
 	}
-	l.status.Phase, l.status.Ready = api.PhaseRunning, true
+	if spec.HealthCheck == nil {
+		l.status.Phase, l.status.Ready = api.PhaseRunning, true
+	}
 	a.log.Info("instance started", "instance", l.inst.Name, "workload", l.inst.Workload,
 		"pid", st.PID, "port", port, "restarts", l.restarts, "enforced", st.Enforced)
 }
@@ -329,7 +384,7 @@ func (a *Agent) start(ctx context.Context, l *local) {
 func (a *Agent) scheduleRestart(l *local, why string) {
 	l.started = false
 	l.restarts++
-	d := time.Second // TODO: exponential backoff
+	d := a.cfg.Backoff.Delay(l.restarts)
 	l.nextStart = a.now().Add(d)
 	l.status = api.InstanceStatus{Phase: api.PhaseFailed, Restarts: l.restarts, Endpoint: "",
 		Message: fmt.Sprintf("%s; restarting in %s", why, d.Round(time.Millisecond))}

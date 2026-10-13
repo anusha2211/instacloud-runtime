@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,11 +17,28 @@ import (
 	"github.com/anusha2211/instacloud-runtime/internal/store"
 )
 
+type fakeProber struct {
+	mu   sync.Mutex
+	fail bool
+}
+
+func (f *fakeProber) Probe(context.Context, string, *api.HealthCheck) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("connection refused")
+	}
+	return nil
+}
+
+func (f *fakeProber) set(fail bool) { f.mu.Lock(); f.fail = fail; f.mu.Unlock() }
+
 type harness struct {
 	t     *testing.T
 	store *store.Store
 	rt    *runtime.Fake
 	agent *Agent
+	probe *fakeProber
 }
 
 func newHarness(t *testing.T) *harness {
@@ -32,11 +51,15 @@ func newHarness(t *testing.T) *harness {
 	a := New(Config{
 		NodeName: "n1", Address: "127.0.0.1", Capacity: api.Resources{MilliCPU: 4000, MemoryMB: 8192},
 		PortBase: 20000, VolumeRoot: t.TempDir(),
+		StartupGrace: time.Nanosecond,
+		Backoff:      Backoff{Base: 20 * time.Millisecond, Max: 100 * time.Millisecond, ResetAfter: time.Hour},
 	}, client.New(srv.URL), rt, log)
 	if err := a.Register(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, store: s, rt: rt, agent: a}
+	h.probe = &fakeProber{}
+	a.SetProber(h.probe)
 	return h
 }
 
@@ -105,6 +128,21 @@ func TestAgentRestartsWithBackoff(t *testing.T) {
 	}
 }
 
+func TestAgentHealthCheckFailureRestarts(t *testing.T) {
+	h := newHarness(t)
+	hc := &api.HealthCheck{Path: "/healthz", IntervalSeconds: 0, TimeoutSeconds: 1, FailureThreshold: 2}
+	h.addInstance("web-a", hc)
+	h.syncUntil("ready", func() bool { in := h.inst("web-a"); return in.Status.Ready })
+
+	h.probe.set(true)
+	h.syncUntil("unhealthy restart", func() bool { return h.inst("web-a").Status.Restarts >= 1 })
+	h.probe.set(false)
+	h.syncUntil("ready again", func() bool { in := h.inst("web-a"); return in.Status.Ready && in.Status.Phase == api.PhaseRunning })
+	if h.rt.Starts["web-a"] < 2 {
+		t.Fatalf("expected restart, starts=%d", h.rt.Starts["web-a"])
+	}
+}
+
 func TestAgentTerminatesAndStopsOrphans(t *testing.T) {
 	h := newHarness(t)
 	h.addInstance("web-a", nil)
@@ -128,4 +166,14 @@ func TestAgentTerminatesAndStopsOrphans(t *testing.T) {
 		st, err := h.rt.Status("web-b")
 		return err != nil || !st.Running
 	})
+}
+
+func TestBackoffDelay(t *testing.T) {
+	b := Backoff{Base: time.Second, Max: 10 * time.Second}
+	want := []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
+	for n, w := range want {
+		if got := b.Delay(n); got != w {
+			t.Errorf("Delay(%d)=%v want %v", n, got, w)
+		}
+	}
 }
