@@ -1,0 +1,14 @@
+{
+  "metadata": { "name": "kv" },
+  "spec": {
+    "kind": "stateful",
+    "replicas": 3,
+    "command": ["./bin/demoapp"],
+    "resources": { "milliCPU": 500, "memoryMB": 256 },
+    "port": true,
+    "healthCheck": { "path": "/healthz", "intervalSeconds": 1, "failureThreshold": 3 },
+    "volumes": [{ "name": "data", "sizeMB": 1024, "mountPath": "/data" }],
+    "placement": { "antiAffinity": true },
+    "terminationGraceSeconds": 5
+  }
+}

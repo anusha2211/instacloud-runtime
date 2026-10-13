@@ -3,6 +3,7 @@ package controller
 import (
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,5 +122,106 @@ func TestServiceScaleUpAndDown(t *testing.T) {
 	e.converge(3)
 	if got := len(e.instances("web")); got != 1 {
 		t.Fatalf("want 1 instance after scale down, got %v", e.phases("web"))
+	}
+}
+
+func TestStatefulOrderedCreateAndScaleDown(t *testing.T) {
+	e := newEnv(t)
+	e.apply("db", api.KindStateful, 3)
+	e.c.Reconcile()
+	insts := e.instances("db")
+	if len(insts) != 1 || insts[0].Name != "db-0" {
+		t.Fatalf("want only db-0 first, got %+v", insts)
+	}
+	vols, _ := store.List[api.Volume](e.s, api.KindVolume)
+	if len(vols) != 3 {
+		t.Fatalf("want 3 volumes pre-created, got %d", len(vols))
+	}
+	e.converge(10)
+	names := map[string]bool{}
+	for _, in := range e.instances("db") {
+		names[in.Name] = true
+		if len(in.Volumes) != 1 || in.Volumes[0] != api.VolumeName("db", "data", in.Ordinal) {
+			t.Fatalf("%s has volumes %v", in.Name, in.Volumes)
+		}
+	}
+	if !names["db-0"] || !names["db-1"] || !names["db-2"] {
+		t.Fatalf("got %v", names)
+	}
+
+	e.apply("db", api.KindStateful, 1)
+	e.c.Reconcile()
+	for _, in := range e.instances("db") {
+		if in.Status.Phase == api.PhaseTerminating && in.Name != "db-2" {
+			t.Fatalf("scale down must start with highest ordinal, got %s", in.Name)
+		}
+	}
+	e.converge(10)
+	if got := e.instances("db"); len(got) != 1 || got[0].Name != "db-0" {
+		t.Fatalf("got %+v", got)
+	}
+	vols, _ = store.List[api.Volume](e.s, api.KindVolume)
+	if len(vols) != 3 {
+		t.Fatalf("volumes must be retained on scale down, got %d", len(vols))
+	}
+}
+
+func TestLostInstances(t *testing.T) {
+	e := newEnv(t)
+	e.apply("web", api.KindService, 2)
+	e.apply("db", api.KindStateful, 1)
+	e.converge(5)
+
+	// Node monitor marks everything on n1 lost.
+	all, _ := store.List[api.Instance](e.s, api.KindInstance)
+	for i := range all {
+		all[i].Status.Phase, all[i].Status.Ready = api.PhaseLost, false
+		all[i].Status.UpdatedAt = e.clock
+		_ = e.s.Update(api.KindInstance, &all[i])
+	}
+	_ = store.Mutate(e.s, api.KindVolume, "db-data-0", func(v *api.Volume) bool { v.BoundNode = "n1"; return true })
+
+	e.c.Reconcile()
+	e.c.Reconcile()
+	// Stateless: replaced right away with new names.
+	if p := e.phases("web"); p[api.PhasePending] != 2 {
+		t.Fatalf("web should have 2 fresh pending replicas, got %v", p)
+	}
+	// Stateful: still Lost until the fence delay passes.
+	var db api.Instance
+	_ = e.s.Get(api.KindInstance, "db-0", &db)
+	if db.Status.Phase != api.PhaseLost {
+		t.Fatalf("db-0 moved before fence delay: %s", db.Status.Phase)
+	}
+
+	e.clock = e.clock.Add(6 * time.Second)
+	e.c.Reconcile()
+	db = api.Instance{}
+	_ = e.s.Get(api.KindInstance, "db-0", &db)
+	if db.Status.Phase != api.PhasePending || db.Node != "" || !strings.Contains(db.Status.Message, "n1") {
+		t.Fatalf("db-0 not requeued: %+v node=%q", db.Status, db.Node)
+	}
+	var v api.Volume
+	_ = e.s.Get(api.KindVolume, "db-data-0", &v)
+	if v.BoundNode != "" {
+		t.Fatalf("volume should be released, bound to %q", v.BoundNode)
+	}
+	if db.Name != "db-0" || db.Volumes[0] != "db-data-0" {
+		t.Fatal("identity must be preserved")
+	}
+}
+
+func TestWorkloadDeletionGC(t *testing.T) {
+	e := newEnv(t)
+	e.apply("db", api.KindStateful, 2)
+	e.converge(8)
+	_ = e.s.Delete(api.KindWorkload, "db", 0)
+	e.converge(4)
+	if n := len(e.instances("db")); n != 0 {
+		t.Fatalf("instances left: %d", n)
+	}
+	vols, _ := store.List[api.Volume](e.s, api.KindVolume)
+	if len(vols) != 0 {
+		t.Fatalf("volumes left: %d", len(vols))
 	}
 }

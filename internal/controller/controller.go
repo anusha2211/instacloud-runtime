@@ -131,7 +131,11 @@ func (c *Controller) Reconcile() {
 	for _, n := range names {
 		wl := s.workloads[n]
 		insts := s.byWL[n]
-		c.reconcileService(wl, insts)
+		if wl.Spec.Kind == api.KindStateful {
+			c.reconcileStateful(wl, insts, s)
+		} else {
+			c.reconcileService(wl, insts)
+		}
 		c.updateStatus(wl, insts)
 	}
 }
