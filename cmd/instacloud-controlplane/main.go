@@ -16,6 +16,7 @@ import (
 
 	"github.com/anusha2211/instacloud-runtime/internal/api"
 	"github.com/anusha2211/instacloud-runtime/internal/apiserver"
+	"github.com/anusha2211/instacloud-runtime/internal/autoscaler"
 	"github.com/anusha2211/instacloud-runtime/internal/controller"
 	"github.com/anusha2211/instacloud-runtime/internal/logging"
 	"github.com/anusha2211/instacloud-runtime/internal/nodemon"
@@ -31,6 +32,8 @@ func main() {
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
 		hbGrace    = flag.Duration("heartbeat-grace", 10*time.Second, "node heartbeat lease; no heartbeat for this long marks the node NotReady")
 		fence      = flag.Duration("stateful-fence-delay", 12*time.Second, "wait after node loss before moving a stateful replica (must exceed the agent lease)")
+		asEvery    = flag.Duration("autoscale-interval", 5*time.Second, "autoscaler evaluation interval")
+		asWindow   = flag.Duration("scale-down-window", 30*time.Second, "autoscaler scale-down stabilisation window")
 		routerAddr = flag.String("router-listen", ":8080", "L7 router listen address (empty to disable)")
 	)
 	flag.Parse()
@@ -69,6 +72,11 @@ func main() {
 			}
 		}()
 		defer rsrv.Close()
+	}
+	if rt != nil {
+		as := &autoscaler.Autoscaler{Store: st, Log: log.With("loop", "autoscaler"), Signal: rt.RPS,
+			Interval: *asEvery, Tolerance: 0.1, ScaleDownWindow: *asWindow}
+		go as.Run(ctx)
 	}
 
 	// Periodic snapshots: a crash loses at most a few seconds of writes, and

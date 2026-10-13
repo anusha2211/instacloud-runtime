@@ -1,0 +1,14 @@
+{
+  "metadata": { "name": "web" },
+  "spec": {
+    "kind": "service",
+    "replicas": 2,
+    "command": ["./bin/demoapp"],
+    "env": { "VERSION": "v2" },
+    "resources": { "milliCPU": 250, "memoryMB": 128 },
+    "port": true,
+    "healthCheck": { "path": "/healthz", "intervalSeconds": 1, "failureThreshold": 3 },
+    "autoscale": { "minReplicas": 2, "maxReplicas": 6, "targetRPSPerReplica": 20 },
+    "terminationGraceSeconds": 5
+  }
+}
