@@ -55,7 +55,9 @@ Plain Go, standard library only. Roughly by package:
 
 Requirements: Go 1.22+, Linux or macOS (cgroup limits are applied on Linux when
 the agent can write to `/sys/fs/cgroup`; otherwise it logs a warning and runs
-unenforced).
+unenforced). The commands below use `make`; without it, build the binaries with
+`for c in instacloud-controlplane instacloud-agent icctl demoapp; do go build -o bin/$c ./cmd/$c; done`
+and then run `./scripts/demo.sh`.
 
 ```bash
 make test        # unit tests
