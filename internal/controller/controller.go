@@ -33,7 +33,11 @@ type Controller struct {
 	Store    *store.Store
 	Log      *slog.Logger
 	Interval time.Duration
-	Now      func() time.Time
+	// StatefulFenceDelay is how long a stateful instance on a lost node waits
+	// before its identity and volume are moved to another node. It must exceed
+	// the agent's self-fencing lease so the old copy has stopped writing.
+	StatefulFenceDelay time.Duration
+	Now                func() time.Time
 }
 
 func (c *Controller) now() time.Time {
@@ -116,6 +120,7 @@ func (c *Controller) Reconcile() {
 
 	s := c.read()
 	c.collectGarbage(s)
+	c.handleLost(s)
 
 	s = c.read() // GC and lost handling change the picture
 	names := make([]string, 0, len(s.workloads))
@@ -158,6 +163,43 @@ func (c *Controller) collectGarbage(s *state) {
 				c.Log.Info("volume deleted", "volume", name, "workload", v.Workload)
 			}
 		}
+	}
+}
+
+// handleLost repairs instances on nodes that stopped heartbeating (marked
+// Lost by the node monitor). Stateless replicas are dropped immediately and
+// replaced by the normal replica-count logic: a short-lived duplicate, if the
+// node was only partitioned, is harmless. Stateful replicas keep their
+// identity and volume and are re-queued for scheduling only after the fence
+// delay, so two copies never write the same volume.
+func (c *Controller) handleLost(s *state) {
+	for i := range s.instances {
+		in := &s.instances[i]
+		if in.Status.Phase != api.PhaseLost {
+			continue
+		}
+		if !in.Stateful() {
+			c.setPhase(in, api.PhaseTerminated, "node lost; replaced")
+			continue
+		}
+		if c.now().Sub(in.Status.UpdatedAt) < c.StatefulFenceDelay {
+			continue
+		}
+		old := in.Node
+		in.Node = ""
+		in.Status = api.InstanceStatus{Phase: api.PhasePending, Restarts: in.Status.Restarts,
+			Message: "rescheduling after loss of node " + old, UpdatedAt: c.now().UTC()}
+		if err := c.Store.Update(api.KindInstance, in); err != nil {
+			continue
+		}
+		for _, vn := range in.Volumes {
+			_ = store.Mutate(c.Store, api.KindVolume, vn, func(v *api.Volume) bool {
+				v.BoundNode, v.Instance, v.Phase = "", "", api.VolumeAvailable
+				return true
+			})
+		}
+		instanceActions.Inc("reschedule_stateful")
+		c.Log.Info("stateful instance rescheduling", "instance", in.Name, "from", old, "volumes", in.Volumes)
 	}
 }
 

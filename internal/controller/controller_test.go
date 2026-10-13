@@ -22,6 +22,7 @@ func newEnv(t *testing.T) *env {
 	e := &env{t: t, s: s, clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	e.c = &Controller{Store: s, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now: func() time.Time { return e.clock }}
+	e.c.StatefulFenceDelay = 5 * time.Second
 	return e
 }
 

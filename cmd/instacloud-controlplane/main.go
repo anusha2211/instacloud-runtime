@@ -17,6 +17,7 @@ import (
 	"github.com/anusha2211/instacloud-runtime/internal/apiserver"
 	"github.com/anusha2211/instacloud-runtime/internal/controller"
 	"github.com/anusha2211/instacloud-runtime/internal/logging"
+	"github.com/anusha2211/instacloud-runtime/internal/nodemon"
 	"github.com/anusha2211/instacloud-runtime/internal/scheduler"
 	"github.com/anusha2211/instacloud-runtime/internal/store"
 )
@@ -26,6 +27,8 @@ func main() {
 		listen   = flag.String("listen", ":7070", "API listen address")
 		dataDir  = flag.String("data-dir", ".data/controlplane", "directory for state snapshots")
 		logLevel = flag.String("log-level", "info", "debug|info|warn|error")
+		hbGrace  = flag.Duration("heartbeat-grace", 10*time.Second, "node heartbeat lease; no heartbeat for this long marks the node NotReady")
+		fence    = flag.Duration("stateful-fence-delay", 12*time.Second, "wait after node loss before moving a stateful replica (must exceed the agent lease)")
 	)
 	flag.Parse()
 	log := logging.New("controlplane", *logLevel)
@@ -43,8 +46,10 @@ func main() {
 
 	sched := &scheduler.Loop{Store: st, Scheduler: scheduler.New(), Log: log.With("loop", "scheduler")}
 	go sched.Run(ctx)
-	ctrl := &controller.Controller{Store: st, Log: log.With("loop", "reconciler")}
+	ctrl := &controller.Controller{Store: st, Log: log.With("loop", "reconciler"), StatefulFenceDelay: *fence}
 	go ctrl.Run(ctx)
+	mon := &nodemon.Monitor{Store: st, Log: log.With("loop", "nodemon"), Grace: *hbGrace}
+	go mon.Run(ctx)
 
 	// Periodic snapshots: a crash loses at most a few seconds of writes, and
 	// every controller is level-triggered so it simply re-converges.
