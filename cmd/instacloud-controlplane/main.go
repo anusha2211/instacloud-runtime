@@ -19,6 +19,7 @@ import (
 	"github.com/anusha2211/instacloud-runtime/internal/autoscaler"
 	"github.com/anusha2211/instacloud-runtime/internal/controller"
 	"github.com/anusha2211/instacloud-runtime/internal/logging"
+	"github.com/anusha2211/instacloud-runtime/internal/metrics"
 	"github.com/anusha2211/instacloud-runtime/internal/nodemon"
 	"github.com/anusha2211/instacloud-runtime/internal/router"
 	"github.com/anusha2211/instacloud-runtime/internal/scheduler"
@@ -78,6 +79,7 @@ func main() {
 			Interval: *asEvery, Tolerance: 0.1, ScaleDownWindow: *asWindow}
 		go as.Run(ctx)
 	}
+	registerStateMetrics(st)
 
 	// Periodic snapshots: a crash loses at most a few seconds of writes, and
 	// every controller is level-triggered so it simply re-converges.
@@ -101,6 +103,7 @@ func main() {
 	}()
 
 	var handler http.Handler = apiserver.New(st, log.With("loop", "api"))
+	handler = logging.Middleware(log.With("loop", "http"), handler)
 	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -117,4 +120,44 @@ func main() {
 		log.Error("final snapshot", "err", err)
 	}
 	log.Info("stopped")
+}
+
+// registerStateMetrics exports gauges derived from store contents, refreshed
+// on every scrape: instances by workload and phase, nodes by status, and
+// per-node requested vs allocatable resources.
+func registerStateMetrics(st *store.Store) {
+	byPhase := metrics.Default.Gauge("instacloud_instances", "Instances by workload and phase.", "workload", "phase")
+	nodes := metrics.Default.Gauge("instacloud_nodes", "Nodes by status.", "status")
+	alloc := metrics.Default.Gauge("instacloud_node_allocatable", "Allocatable resources per node.", "node", "resource")
+	req := metrics.Default.Gauge("instacloud_node_requested", "Requested resources per node.", "node", "resource")
+	metrics.Default.OnCollect(func() {
+		insts, _ := store.List[api.Instance](st, api.KindInstance)
+		ns, _ := store.List[api.Node](st, api.KindNode)
+		byPhase.Reset()
+		nodes.Reset()
+		alloc.Reset()
+		req.Reset()
+		counts := map[[2]string]int{}
+		used := map[string]api.Resources{}
+		for _, in := range insts {
+			counts[[2]string{in.Workload, string(in.Status.Phase)}]++
+			if in.Holds() {
+				used[in.Node] = used[in.Node].Add(in.Request())
+			}
+		}
+		for k, n := range counts {
+			byPhase.Set(float64(n), k[0], k[1])
+		}
+		status := map[string]int{}
+		for _, n := range ns {
+			status[string(n.Status)]++
+			alloc.Set(float64(n.Allocatable.MilliCPU), n.Name, "cpu_millicores")
+			alloc.Set(float64(n.Allocatable.MemoryMB), n.Name, "memory_mb")
+			req.Set(float64(used[n.Name].MilliCPU), n.Name, "cpu_millicores")
+			req.Set(float64(used[n.Name].MemoryMB), n.Name, "memory_mb")
+		}
+		for s, n := range status {
+			nodes.Set(float64(n), s)
+		}
+	})
 }
