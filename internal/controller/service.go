@@ -14,8 +14,10 @@ func (c *Controller) reconcileService(wl *api.Workload, insts []*api.Instance) {
 	for _, in := range insts {
 		switch {
 		case !in.Status.Phase.Live():
-		default:
+		case in.Generation == wl.Generation:
 			cur = append(cur, in)
+		default:
+			old = append(old, in)
 		}
 	}
 	readyCur, readyOld := countReady(cur), countReady(old)

@@ -74,4 +74,15 @@ func (c *Controller) reconcileStateful(wl *api.Workload, insts []*api.Instance, 
 		}
 	}
 
+	// All ordinals ready: roll out a new generation highest ordinal first. The
+	// replacement reuses the same name and volume.
+	if busy {
+		return
+	}
+	for ord := want - 1; ord >= 0; ord-- {
+		if in := byOrd[ord]; in.Generation != wl.Generation {
+			c.terminate(in, "rollout: replaced by generation "+itoa(wl.Generation))
+			return
+		}
+	}
 }

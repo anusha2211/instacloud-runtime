@@ -125,6 +125,41 @@ func TestServiceScaleUpAndDown(t *testing.T) {
 	}
 }
 
+func TestServiceRollingUpdateKeepsCapacity(t *testing.T) {
+	e := newEnv(t)
+	e.apply("web", api.KindService, 3)
+	e.converge(3)
+	e.apply("web", api.KindService, 3, func(s *api.WorkloadSpec) { s.Env = map[string]string{"V": "2"} })
+
+	for round := 0; round < 20; round++ {
+		e.c.Reconcile()
+		ready, live := 0, 0
+		for _, in := range e.instances("web") {
+			if in.Status.Phase.Live() {
+				live++
+				if in.Status.Ready {
+					ready++
+				}
+			}
+		}
+		if ready < 3 {
+			t.Fatalf("round %d: ready capacity dropped to %d", round, ready)
+		}
+		if live > 4 {
+			t.Fatalf("round %d: surge exceeded: %d live", round, live)
+		}
+		e.agentTick()
+	}
+	for _, in := range e.instances("web") {
+		if in.Generation != 2 || in.Spec.Env["V"] != "2" {
+			t.Fatalf("instance %s still on generation %d", in.Name, in.Generation)
+		}
+	}
+	if n := len(e.instances("web")); n != 3 {
+		t.Fatalf("want 3 instances, got %d", n)
+	}
+}
+
 func TestStatefulOrderedCreateAndScaleDown(t *testing.T) {
 	e := newEnv(t)
 	e.apply("db", api.KindStateful, 3)
